@@ -10,7 +10,10 @@ JWT Confusioner discovers signing keys, verifies a valid token, and generates a 
 ## What it does
 
 1. **Parses** a provided JWT (header, payload, signature).  
-2. **Discovers JWKS** automatically from the `iss` claim (via OIDC discovery → `/.well-known/openid-configuration` → `jwks_uri`; fallback to `/.well-known/jwks.json`).  
+2. **Discovers JWKS** automatically via:
+   - **OIDC from `iss`** → `/.well-known/openid-configuration` → `jwks_uri` (fallback: `/.well-known/jwks.json`)
+   - **Payload URL scan**: regex-find `https://…` in all payload fields, then try `<url>/jwks.json` → `<url>/.well-known/jwks.json` (fallback).
+     If both endpoints return 404, a helper note is shown with a link to `rsa_sign2n` for recovering RSA public keys from signatures.
 3. **Fetches JWKS** and selects the correct key by `kid`/`alg`.  
 4. **Verifies** the original JWT signature.  
 5. **Crafts a suite** of malicious JWTs to check for signature confusion, algorithm downgrades, key misuse, and validation errors.  
