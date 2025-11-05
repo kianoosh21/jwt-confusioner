@@ -135,10 +135,10 @@ Header / JWKS Abuse
 Add your images here (replace with your file paths):
 
     CLI Help:
-      ![CLI Help](1.png)
+      ![CLI Help](docs/1.png)
 
     Sample Run:
-      ![Sample Run](2.png)
+      ![Sample Run](docs/2.png)
 
     Sample Run:
-      ![Sample Results](3.png)
+      ![Sample Results](docs/3.png)
