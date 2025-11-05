@@ -132,11 +132,22 @@ Header / JWKS Abuse
 
 ## Screenshots
 
-    CLI Help:
-      ![CLI Help](/home/kali/BBP/Moonpig/Archive/test/jwt-confusioner/docs/1.png)
-
-    Sample Run:
-      ![Sample Run](/home/kali/BBP/Moonpig/Archive/test/jwt-confusioner/docs/2.png)
-
-    Sample Run:
-      ![Sample Results](/home/kali/BBP/Moonpig/Archive/test/jwt-confusioner/docs/3.png)
+-
+-    CLI Help:
+-      ![CLI Help](docs/1.png)
+-
+-    Sample Run:
+-      ![Sample Run](docs/2.png)
+-
+-    Sample Run:
+-      ![Sample Results](docs/3.png)
++Add your images here (replace with your file paths), and make sure there’s **no indentation**:
++
++**CLI Help**  
++![CLI Help](docs/1.png)
++
++**Sample Run**  
++![Sample Run](docs/2.png)
++
++**Sample Results**  
++![Sample Results](docs/3.png)
