@@ -133,11 +133,11 @@ Header / JWKS Abuse
 ## Screenshots
 
 
-+**CLI Help**  
-+![CLI Help](docs/1.png)
-+
-+**Sample Run**  
-+![Sample Run](docs/2.png)
-+
-+**Sample Results**  
-+![Sample Results](docs/3.png)
+**CLI Help**  
+![CLI Help](docs/1.png)
+
+**Sample Run**  
+![Sample Run](docs/2.png)
+
+**Sample Results**  
+![Sample Results](docs/3.png)
