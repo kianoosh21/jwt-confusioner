@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
 """
-jwt-confusioner.py — Automated JWT verification & fuzzing harness (enhanced, fixed)
+jwt-confusioner.py — Automated JWT verification & fuzzing harness (enhanced, full)
 
-Key features:
-- Discovery:
-  • OIDC from 'iss' → .well-known/openid-configuration → jwks_uri (fallback: /.well-known/jwks.json)
-  • Payload URL scan: find https://... strings; try <url>/jwks.json then <url>/.well-known/jwks.json
-    (now returns the actual URL used so PyJWKClient works)
-- HS* confusion testing with many public-key encodings (PEM/DER/raw point/JWK JSON/RSA modulus & n||e).
-- Negative alg tests across ES/RS/PS/HS + alg=none; claim tampering; RFC 7797 (b64:false); kid/jku/x5u abuse.
-- Pretty output option that adds blank lines between entries in tokens.json.
+What's in this build:
+- New manual switches:
+    • --jwks-url / --jwks-uri         : provide a JWKS endpoint directly
+    • --public-key-url / --pubkey-url / --url : provide a single public key (PEM/DER) URL directly
+- Issuer-based discovery tries (in order):
+    1) <iss>/.well-known/openid-configuration → jwks_uri
+    2) <iss>/.well-known/jwks.json
+    3) <iss>/jwks.json
+- Payload URL scan: regex-find https://… in payload strings and try:
+    <url>/jwks.json  →  <url>/.well-known/jwks.json (fallback on 404)
+- If all discovery paths fail, we print a clear hint:
+    - Use --jwks-url or --public-key-url (manual)
+    - Or see: https://github.com/silentsignal/rsa_sign2n to recover RSA public key from signatures
+- HS* confusion using many public-key encodings (PEM/DER/PEM-no-newlines/JWK JSON/EC raw point/RSA modulus & n||e).
+- Negative tests across ES/RS/PS/HS + alg=none; claim tampering; RFC 7797 b64:false; kid/jku/x5u abuse.
+- Pretty output mode that inserts blank lines between JSON entries.
 
-Ethics: Only use on systems you own or have explicit permission to test.
+Ethics: Only test systems you own or have explicit permission to assess.
 """
 
 import argparse
@@ -30,6 +38,7 @@ from jwt import PyJWKClient
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from cryptography.hazmat.primitives.serialization import (
     load_pem_public_key,
+    load_der_public_key,
     Encoding,
     PublicFormat,
 )
@@ -59,6 +68,10 @@ def pretty_header_payload(token: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     return json.loads(b64url_decode(h_b64)), json.loads(b64url_decode(p_b64))
 
 def write_tokens_with_blank_lines(tokens: dict, path: str):
+    """
+    Write a JSON object where each top-level entry is separated by a blank line.
+    Output remains valid JSON.
+    """
     items = list(tokens.items())
     with open(path, "w") as f:
         f.write("{\n")
@@ -73,34 +86,71 @@ def write_tokens_with_blank_lines(tokens: dict, path: str):
 
 # ==================== Discovery helpers ====================
 
-def discover_oidc_jwks_uri(issuer: str, timeout: int = 10, insecure: bool = False) -> Optional[str]:
-    iss = issuer.rstrip("/")
-    well_known = f"{iss}/.well-known/openid-configuration"
-    try:
-        r = requests.get(well_known, timeout=timeout, verify=not insecure)
-        if r.ok:
-            data = r.json()
-            jwks = data.get("jwks_uri")
-            if jwks:
-                return jwks
-    except Exception:
-        pass
-    return f"{iss}/.well-known/jwks.json"
-
 HTTPS_URL_REGEX = re.compile(r'https://[A-Za-z0-9\.\-_:\/%#\?\=&]+')
 
 def extract_https_urls_from_payload(payload: Dict[str, Any]) -> List[str]:
+    """
+    Recursively search all string fields in the payload for https:// URLs.
+    """
     urls = set()
     def walk(x):
         if isinstance(x, dict):
-            for v in x.values(): walk(v)
+            for v in x.values():
+                walk(v)
         elif isinstance(x, list):
-            for v in x: walk(v)
+            for v in x:
+                walk(v)
         elif isinstance(x, str):
             for m in HTTPS_URL_REGEX.findall(x):
                 urls.add(m.rstrip("/"))
     walk(payload)
     return list(urls)
+
+def discover_and_fetch_from_issuer(issuer: str, timeout: int = 10, insecure: bool = False) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Try all reasonable issuer-derived JWKS locations, returning (jwks_json, used_url).
+    Order:
+      1) OIDC discovery: <iss>/.well-known/openid-configuration → jwks_uri
+      2) <iss>/.well-known/jwks.json
+      3) <iss>/jwks.json
+    Continues on 404; aborts that step on other HTTP errors.
+    """
+    iss = issuer.rstrip("/")
+
+    # 1) OIDC discovery
+    try:
+        r = requests.get(f"{iss}/.well-known/openid-configuration", timeout=timeout, verify=not insecure)
+        if r.status_code == 200:
+            data = r.json()
+            jwks_uri = data.get("jwks_uri")
+            if jwks_uri:
+                rj = requests.get(jwks_uri, timeout=timeout, verify=not insecure)
+                if rj.status_code == 200:
+                    return rj.json(), jwks_uri
+                # else continue to next steps
+    except Exception:
+        pass
+
+    # 2) <iss>/.well-known/jwks.json
+    try:
+        u = f"{iss}/.well-known/jwks.json"
+        r2 = requests.get(u, timeout=timeout, verify=not insecure)
+        if r2.status_code == 200:
+            return r2.json(), u
+        # if 404, try (3)
+    except Exception:
+        pass
+
+    # 3) <iss>/jwks.json
+    try:
+        u = f"{iss}/jwks.json"
+        r3 = requests.get(u, timeout=timeout, verify=not insecure)
+        if r3.status_code == 200:
+            return r3.json(), u
+    except Exception:
+        pass
+
+    return None, None
 
 def try_fetch_jwks_from_base_url(base_url: str, timeout: int = 10, insecure: bool = False) -> Tuple[Optional[Dict[str, Any]], bool, Optional[str]]:
     """
@@ -154,7 +204,76 @@ def select_jwk_for_token(jwks: Dict[str, Any], token_header: Dict[str, Any]) -> 
             return k
     return keys[0]
 
-# ==================== Key handling & formats ====================
+# ========= Public-key URL support (PEM/DER) → single JWK =========
+
+def int_to_bytes(i: int, length: Optional[int] = None) -> bytes:
+    if i == 0:
+        b = b"\x00"
+    else:
+        b = i.to_bytes((i.bit_length() + 7) // 8, byteorder="big")
+    if length is not None and len(b) < length:
+        b = (b"\x00" * (length - len(b))) + b
+    return b
+
+def public_key_to_jwk(pub) -> Dict[str, Any]:
+    """Convert a cryptography public key (RSA or EC) to a minimal JWK dict."""
+    if isinstance(pub, rsa.RSAPublicKey):
+        nums = pub.public_numbers()
+        n = int_to_bytes(nums.n)
+        e = int_to_bytes(nums.e)
+        return {
+            "kty": "RSA",
+            "n": b64url_encode(n),
+            "e": b64url_encode(e),
+            "use": "sig",
+            "alg": "RS256",  # default hint; server may use any RS*
+        }
+    elif isinstance(pub, ec.EllipticCurvePublicKey):
+        nums = pub.public_numbers()
+        curve = nums.curve
+        # Map curve to JWK 'crv' and coordinate length
+        if isinstance(curve, ec.SECP256R1):
+            crv, size = "P-256", 32
+            alg = "ES256"
+        elif isinstance(curve, ec.SECP384R1):
+            crv, size = "P-384", 48
+            alg = "ES384"
+        elif isinstance(curve, ec.SECP521R1):
+            # P-521 coords are 66 bytes (521 bits padded to 528)
+            crv, size = "P-521", 66
+            alg = "ES512"
+        else:
+            crv, size, alg = "P-256", 32, "ES256"
+        x = int_to_bytes(nums.x, size)
+        y = int_to_bytes(nums.y, size)
+        return {
+            "kty": "EC",
+            "crv": crv,
+            "x": b64url_encode(x),
+            "y": b64url_encode(y),
+            "use": "sig",
+            "alg": alg,  # hint
+        }
+    else:
+        raise ValueError("Unsupported public key type for --public-key-url")
+
+def fetch_public_key_from_url(url: str, timeout: int = 10, insecure: bool = False) -> Dict[str, Any]:
+    """
+    Fetch a single public key (PEM or DER) and convert to a JWK dict.
+    """
+    r = requests.get(url, timeout=timeout, verify=not insecure)
+    r.raise_for_status()
+    data = r.content
+    # Try PEM first
+    try:
+        pub = load_pem_public_key(data)
+    except Exception:
+        # Try DER
+        pub = load_der_public_key(data)
+    jwk = public_key_to_jwk(pub)
+    return jwk  # single-key JWK
+
+# ==================== Key handling & formats for HS-confusion ====================
 
 def jwk_to_public_key(jwk: Dict[str, Any]):
     kty = jwk.get("kty")
@@ -212,6 +331,10 @@ def ec_uncompressed_point(jwk: Dict[str, Any]) -> Optional[bytes]:
     return b"\x04" + b64url_decode(x) + b64url_decode(y)
 
 def build_secret_candidates(jwk: Dict[str, Any]) -> List[Tuple[str, bytes]]:
+    """
+    Return a list of (name, bytes) for different public-key encodings that servers may (incorrectly)
+    treat as HMAC secrets in HS* alg confusion scenarios.
+    """
     candidates: List[Tuple[str, bytes]] = []
     try:
         pem = pem_from_jwk(jwk)
@@ -220,16 +343,20 @@ def build_secret_candidates(jwk: Dict[str, Any]) -> List[Tuple[str, bytes]]:
         candidates.append(("der_spki", der_from_pem(pem)))
     except Exception:
         pass
+
     candidates.append(("jwk_json", jwk_json_bytes(jwk)))
+
     if jwk.get("kty") == "RSA":
         n = rsa_modulus_bytes(jwk)
         ne = rsa_n_e_concat(jwk)
         if n:  candidates.append(("rsa_modulus_n", n))
         if ne: candidates.append(("rsa_n_concat_e", ne))
+
     if jwk.get("kty") == "EC":
         point = ec_uncompressed_point(jwk)
         if point: candidates.append(("ec_uncompressed_point", point))
-    # de-dup by bytes
+
+    # De-duplicate by bytes
     unique: List[Tuple[str, bytes]] = []
     seen = set()
     for name, b in candidates:
@@ -292,6 +419,13 @@ def re_sign_hs(message: bytes, secret: bytes, hash_name: str) -> str:
 
 def forge_with_header_payload(header: Dict[str, Any], payload_b64: str,
                               secret: Optional[bytes], alg: str) -> str:
+    """
+    For HS* algorithms:
+      - If secret is provided, produce a real HMAC signature (confusion tests).
+      - If secret is None, emit a dummy signature (negative alg tests).
+    For non-HS algorithms:
+      - Emit a dummy signature (by design).
+    """
     header_b64 = b64url_encode(json_compact(header).encode())
     if alg.startswith("HS"):
         if secret is None:
@@ -385,14 +519,17 @@ def craft_suite(original: str, jwk: Dict[str, Any],
 def build_parser() -> argparse.ArgumentParser:
     epilog = r"""
 Examples:
-  # Basic run (OIDC via iss + payload URL scan for /jwks.json and /.well-known/jwks.json)
+  # Basic run (issuer discovery + payload URL scan)
   jwt-confusioner.py -t '<JWT>'
+
+  # Provide JWKS directly
+  jwt-confusioner.py -t '<JWT>' --jwks-url 'https://idp.example.com/jwks.json'
+
+  # Provide a single public key (PEM/DER) directly
+  jwt-confusioner.py -t '<JWT>' --public-key-url 'https://idp.example.com/public.pem'
 
   # Audience verification for the original token
   jwt-confusioner.py -t '<JWT>' --aud 'my-audience'
-
-  # Override JWKS URI
-  jwt-confusioner.py -t '<JWT>' --jwks-uri 'https://idp.example.com/.well-known/jwks.json'
 
   # Limit number of HS* secret encodings tried
   jwt-confusioner.py -t '<JWT>' --limit-secrets 3
@@ -404,21 +541,24 @@ Examples:
         prog="jwt-confusioner.py",
         description=(
             "Automated JWT verification & fuzzing harness.\n"
-            "• Discovers JWKS from `iss` (OIDC), also scans payload for https:// URLs and tries /jwks.json then /.well-known/jwks.json.\n"
-            "• Verifies the original token.\n"
-            "• Crafts negative/abuse tokens (alg confusion across HS256/384/512 using multiple public-key encodings,\n"
-            "  alg=none, wrong algs ES/RS/PS/HS, claim tampering, RFC 7797, kid/jku/x5u abuse) and saves them.\n"
+            "• Issuer discovery: OIDC → .well-known/jwks.json → /jwks.json.\n"
+            "• Payload URL scan: find https://… and try /jwks.json then /.well-known/jwks.json.\n"
+            "• Manual overrides: --jwks-url (JWKS), --public-key-url (PEM/DER).\n"
+            "• Verifies the original token; crafts confusion/negative tokens and saves them.\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=epilog,
     )
     parser.add_argument("-t", "--token", required=True, help="Original JWT (three-part compact form).")
-    parser.add_argument("--jwks-uri", help="Override JWKS URI. If omitted, discovered from 'iss' & URL scanning.")
+    parser.add_argument("--jwks-uri", "--jwks-url", dest="jwks_url",
+                        help="Provide JWKS URL directly (skips discovery).")
+    parser.add_argument("--public-key-url", "--pubkey-url", "--url", dest="public_key_url",
+                        help="Provide a single public key URL (PEM or DER). Will be converted to a JWK.")
     parser.add_argument("--aud", help="Expected audience for additional verification of the original token.")
     parser.add_argument("-o", "--out", default="tokens.json", help="Output JSON file for crafted tokens (default: tokens.json).")
     parser.add_argument("--print-payload", action="store_true", help="Print parsed header and payload of the input JWT.")
     parser.add_argument("--timeout", type=int, default=10, help="HTTP timeout (seconds) for discovery/JWKS fetch (default: 10).")
-    parser.add_argument("--insecure", action="store_true", help="Disable TLS verification for JWKS fetch (NOT recommended).")
+    parser.add_argument("--insecure", action="store_true", help="Disable TLS verification for HTTP fetches (NOT recommended).")
     parser.add_argument("--include", help="Comma-separated list of test IDs to include (defaults to all).")
     parser.add_argument("--exclude", help="Comma-separated list of test IDs to exclude.")
     parser.add_argument("--pretty-blank-lines", action="store_true", help="Write tokens.json with a blank line between entries.")
@@ -439,30 +579,41 @@ def main():
         print("\n--- Header ---"); print(json.dumps(header, indent=2, sort_keys=True))
         print("--- Payload ---"); print(json.dumps(payload, indent=2, sort_keys=True))
 
-    jwks_uri: Optional[str] = args.jwks_uri
+    jwks_uri: Optional[str] = None
     jwks: Optional[Dict[str, Any]] = None
+    selected_jwk: Optional[Dict[str, Any]] = None
     any_both_404 = False
 
-    # 1) Explicit JWKS URI
-    if jwks_uri:
+    # 0) Manual overrides first
+    if args.jwks_url:
         try:
-            jwks = fetch_jwks(jwks_uri, timeout=args.timeout, insecure=args.insecure)
+            jwks = fetch_jwks(args.jwks_url, timeout=args.timeout, insecure=args.insecure)
+            jwks_uri = args.jwks_url
+            print(f"[+] Using JWKS from --jwks-url: {jwks_uri}")
         except Exception as e:
-            print(f"[!] Failed to fetch JWKS from --jwks-uri: {e}", file=sys.stderr)
+            print(f"[!] Failed to fetch JWKS from --jwks-url: {e}", file=sys.stderr)
 
-    # 2) OIDC via iss
+    if jwks is None and args.public_key_url:
+        try:
+            jwk_single = fetch_public_key_from_url(args.public_key_url, timeout=args.timeout, insecure=args.insecure)
+            jwks = {"keys": [jwk_single]}
+            jwks_uri = None  # single-key mode
+            print(f"[+] Using public key from --public-key-url: {args.public_key_url}")
+        except Exception as e:
+            print(f"[!] Failed to fetch/parse --public-key-url: {e}", file=sys.stderr)
+
+    # 1) Issuer-derived discovery: OIDC → .well-known/jwks.json → /jwks.json
     if jwks is None:
         iss = payload.get("iss")
         if iss:
-            discovered = discover_oidc_jwks_uri(iss, timeout=args.timeout, insecure=args.insecure)
-            if discovered:
-                try:
-                    jwks = fetch_jwks(discovered, timeout=args.timeout, insecure=args.insecure)
-                    if jwks: jwks_uri = discovered
-                except Exception as e:
-                    print(f"[!] OIDC discovery failed ({discovered}): {e}", file=sys.stderr)
+            jwks_try, used = discover_and_fetch_from_issuer(iss, timeout=args.timeout, insecure=args.insecure)
+            if jwks_try and isinstance(jwks_try, dict) and jwks_try.get("keys"):
+                jwks = jwks_try
+                jwks_uri = used
+            else:
+                print(f"[!] Issuer-based discovery failed for {iss} (no JWKS at openid-config/.well-known/jwks.json or /jwks.json).", file=sys.stderr)
 
-    # 3) Payload URL scan
+    # 2) Payload URL scan: <url>/jwks.json → <url>/.well-known/jwks.json
     if jwks is None:
         urls = extract_https_urls_from_payload(payload)
         for base_url in urls:
@@ -470,31 +621,32 @@ def main():
             any_both_404 = any_both_404 or both_404
             if jwks_try and isinstance(jwks_try, dict) and jwks_try.get("keys"):
                 jwks = jwks_try
-                jwks_uri = used_url  # actual URL used (valid for PyJWKClient)
+                jwks_uri = used_url  # actual URL used
                 break
         if jwks is None:
             if urls:
                 print(f"[!] Failed to fetch public key via URL scan. Tried: {', '.join(urls)}", file=sys.stderr)
-                if any_both_404:
-                    print(
-                        "[!] Public key could not be fetched (both /jwks.json and /.well-known/jwks.json returned 404). "
-                        "If you're sure the signature uses an asymmetric algorithm, consider this tool to derive the RSA public key from signatures:\n"
-                        "    https://github.com/silentsignal/rsa_sign2n",
-                        file=sys.stderr
-                    )
-            else:
-                print("[!] No https:// URLs found in payload to try /jwks.json discovery.", file=sys.stderr)
 
+    # 3) Final failure message with guidance
     if jwks is None:
-        print("[!] Could not obtain JWKS; aborting. Provide --jwks-uri or ensure iss/URL discovery works.", file=sys.stderr)
+        print(
+            "[!] Could not obtain any signing key.\n"
+            "    Try one of these:\n"
+            "      • Provide JWKS directly: --jwks-url https://example.com/jwks.json\n"
+            "      • Provide a single public key: --public-key-url https://example.com/public.pem\n"
+            "      • Or recover RSA public key from signatures with:\n"
+            "        https://github.com/silentsignal/rsa_sign2n",
+            file=sys.stderr
+        )
         sys.exit(1)
 
-    print(f"[+] Using JWKS source: {jwks_uri}")
+    print(f"[+] Using JWKS source: {jwks_uri if jwks_uri else '(single public key mode)'}")
 
-    jwk = select_jwk_for_token(jwks, header)
-    if not jwk:
+    # Select JWK for this token (in single public key mode this just picks the only one)
+    selected_jwk = select_jwk_for_token(jwks, header)
+    if not selected_jwk:
         print("[!] Could not select a matching JWK (kid/alg).", file=sys.stderr); sys.exit(1)
-    print(f"[+] Selected JWK kid={jwk.get('kid')} kty={jwk.get('kty')} alg={jwk.get('alg')} use={jwk.get('use')}")
+    print(f"[+] Selected JWK kid={selected_jwk.get('kid')} kty={selected_jwk.get('kty')} alg={selected_jwk.get('alg')} use={selected_jwk.get('use')}")
 
     # Verify original token (baseline)
     verified = False
@@ -505,16 +657,16 @@ def main():
         else:
             print(f"[!] Original token verification via JWKS URL FAILED: {err}")
     if not verified:
-        ok, err = verify_original_jwt_with_local_key(token, jwk)
+        ok, err = verify_original_jwt_with_local_key(token, selected_jwk)
         if ok:
             print("[+] Original token: SIGNATURE VALID (via local JWK)")
         else:
             print(f"[!] Original token verification via local JWK FAILED: {err}")
 
-    # Optional audience-checked verification
+    # Audience-checked verification (optional)
     if args.aud:
         try:
-            pem_public = pem_from_jwk(jwk)
+            pem_public = pem_from_jwk(selected_jwk)
             pub = load_pem_public_key(pem_public)
             jwt.decode(
                 token,
@@ -531,7 +683,7 @@ def main():
     include = args.include.split(",") if args.include else None
     exclude = args.exclude.split(",") if args.exclude else None
     try:
-        crafted = craft_suite(token, jwk, include=include, exclude=exclude,
+        crafted = craft_suite(token, selected_jwk, include=include, exclude=exclude,
                               limit_secrets=(args.limit_secrets if args.limit_secrets > 0 else None))
     except Exception as e:
         print(f"[!] Failed to craft tokens: {e}", file=sys.stderr); sys.exit(1)
